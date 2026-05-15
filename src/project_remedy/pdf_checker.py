@@ -646,6 +646,19 @@ _FILENAME_ALT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Filesystem-path patterns — Word docs and Office producers sometimes leak
+# the source path of an embedded image (``C:\Users\...\photo.jpg``,
+# ``/Users/.../photo.png``) into /Alt when authors don't fill it in.
+# Treat those as generic so vision regenerates a real description.
+_PATH_ALT_PATTERNS = (
+    re.compile(r"^[A-Za-z]:[\\/]"),                # Windows: C:\... or C:/...
+    re.compile(r"^/(?:Users|home|Volumes|var|tmp)/", re.IGNORECASE),
+    re.compile(
+        r"[\\/].+\.(?:png|jpe?g|gif|bmp|tiff?|svg|webp|heic|raw)\b",
+        re.IGNORECASE,
+    ),  # any path containing a slash + image filename anywhere in the string
+)
+
 # Prefixes emitted by ``_fallback_figure_alt_text`` when the vision model is
 # unavailable or returns nothing usable. Surfacing them as generic lets a later
 # remediation pass with a working vision model self-heal the alt text.
@@ -674,6 +687,11 @@ def _is_generic_alt_text(alt_text: str) -> bool:
         return True
     if _FILENAME_ALT_PATTERN.match(normalized):
         return True
+    # Bare-filesystem-path alts (the original /Alt that producers leaked
+    # into the PDF when the author never wrote real alt text).
+    for pat in _PATH_ALT_PATTERNS:
+        if pat.search(alt_text.strip()):
+            return True
     # Catch numbered variants like "Figure 1", "Image 2", "img3"
     if re.match(r"^(figure|image|img|picture|photo|graphic)\s*\d*$", normalized):
         return True

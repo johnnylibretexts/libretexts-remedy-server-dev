@@ -5671,7 +5671,9 @@ def _read_page_content_stream_bytes(page) -> bytes | None:
         return None
 
 
-def _rewrite_artifact_scope_to_figure(page, image_xobject_name: str) -> int | None:
+def _rewrite_artifact_scope_to_figure(
+    pdf: pikepdf.Pdf, page, image_xobject_name: str,
+) -> int | None:
     """Rewrite ``/Artifact BMC ... Do /<image_xobject_name> ... EMC`` to
     ``/Figure <</MCID N>> BDC ... EMC`` where N is a fresh MCID for the page.
 
@@ -5702,7 +5704,7 @@ def _rewrite_artifact_scope_to_figure(page, image_xobject_name: str) -> int | No
     if count == 0:
         return None
     try:
-        new_stream = page.obj.owner.make_stream(new_raw)
+        new_stream = pdf.make_stream(new_raw)
         page.Contents = new_stream
     except Exception:
         return None
@@ -5866,7 +5868,7 @@ def fix_substantive_artifact_images(
             # marked-content region rather than to /OBJR object references,
             # so MCID-linkage is required for the alt-text to actually
             # surface in assistive-tech UI.
-            new_mcid = _rewrite_artifact_scope_to_figure(page, xname)
+            new_mcid = _rewrite_artifact_scope_to_figure(pdf, page, xname)
             if new_mcid is None:
                 continue
             figure = pikepdf.Dictionary({
