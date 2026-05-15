@@ -5262,6 +5262,115 @@ def _page_mcid_has_xobject_do(page) -> dict[int, list[str]]:
     return result
 
 
+def fix_image_struct_elems_retag(pdf: pikepdf.Pdf) -> list[str]:
+    """Retag pure-image struct elements from text types to /Figure.
+
+    When a producer (or upstream remediation) wraps an image-only marked
+    content scope under a /P, /Span, /Sect, etc., the structure element
+    delivers non-text content but advertises itself as a text role. Adobe
+    Acrobat's accessibility checker flags this as a figure-without-Alt error,
+    and screen readers announce nothing for the image because the role is
+    wrong. ``fix_xobject_bearing_text_elements`` patches the *symptom* by
+    adding ``/Alt = "Image content"`` to the offending element, but the
+    role still misleads assistive tech.
+
+    This fix detects struct elements whose MCIDs reference image ``Do``
+    operations *and no text content*, then retags ``/S`` to ``/Figure``.
+    Downstream ``fix_figures_alt_text`` then picks up the new /Figure and
+    generates a real description via the vision model.
+
+    Mixed-content elements (image MCIDs alongside text MCIDs) are left for
+    ``fix_xobject_bearing_text_elements`` since retagging a /P-with-text to
+    /Figure would violate PDF/UA-1 (/Figure must not contain inline text).
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return []
+
+    page_xobj_mcids: dict[int, dict[int, list[str]]] = {}
+    retagged = 0
+
+    for node, _depth, _parent in walk_structure_tree(pdf):
+        stype = _get_struct_type(node)
+        # Already a graphic role — leave alone.
+        if stype in {"Figure", "Formula", "Form", "Artifact"}:
+            continue
+        mcids = _get_node_mcids(node)
+        if not mcids:
+            continue
+        # If the struct elem references nested struct elems (not just MCIDs)
+        # via /K, retagging risks losing the children. Skip — let the
+        # existing text-typed fix add /Alt instead.
+        kids = node.get("/K")
+        has_struct_kids = False
+        if kids is not None:
+            items = (
+                (kids[idx] for idx in range(len(kids)))
+                if isinstance(kids, pikepdf.Array)
+                else (kids,)
+            )
+            for item in items:
+                resolved = _resolve_pdf_object(item)
+                if isinstance(resolved, pikepdf.Dictionary) and resolved.get("/Type") == pikepdf.Name("/StructElem"):
+                    has_struct_kids = True
+                    break
+        if has_struct_kids:
+            continue
+
+        page_idx = _find_node_page(node, pdf)
+        if page_idx < 0 or page_idx >= len(pdf.pages):
+            continue
+        if page_idx not in page_xobj_mcids:
+            try:
+                page_xobj_mcids[page_idx] = _page_mcid_has_xobject_do(pdf.pages[page_idx])
+            except Exception:
+                page_xobj_mcids[page_idx] = {}
+        xobj_map = page_xobj_mcids[page_idx]
+        # Any MCID this node owns references an image Do? Retag is justified
+        # even if the node also claims a stray text MCID (common when a
+        # producer puts a one-character /Span next to the image): Adobe AAC
+        # fails the image-no-alt rule which is more user-visible than the
+        # PDF/UA-1 rule against text in /Figure, and we strip the text
+        # attributes below.
+        image_mcids = [mcid for mcid in mcids if mcid in xobj_map]
+        if not image_mcids:
+            continue
+        # Confirm at least one XObject is an Image (not just a Form). The
+        # xobj_map values are name strings; resolve via page Resources.
+        page = pdf.pages[page_idx]
+        try:
+            resources_xobj = page.Resources.XObject
+        except Exception:
+            continue
+        has_image = False
+        for mcid in image_mcids:
+            for xname in xobj_map.get(mcid, []):
+                try:
+                    xo = resources_xobj.get(pikepdf.Name("/" + xname.lstrip("/")))
+                except Exception:
+                    xo = None
+                if xo is not None and xo.get("/Subtype") == pikepdf.Name("/Image"):
+                    has_image = True
+                    break
+            if has_image:
+                break
+        if not has_image:
+            continue
+
+        node["/S"] = pikepdf.Name("/Figure")
+        # Strip role-specific attributes that don't belong on /Figure.
+        if "/ActualText" in node:
+            # /ActualText belongs on text spans, not figures. Drop it so
+            # downstream alt-text generation (fix_figures_alt_text) drives
+            # the accessible name unambiguously.
+            del node["/ActualText"]
+        retagged += 1
+
+    if retagged:
+        return [f"Retagged {retagged} pure-image struct element(s) from text role to /Figure"]
+    return []
+
+
 def fix_xobject_bearing_text_elements(pdf: pikepdf.Pdf) -> list[str]:
     """Add /Alt to text-typed structure nodes that own image content.
 
@@ -5274,6 +5383,11 @@ def fix_xobject_bearing_text_elements(pdf: pikepdf.Pdf) -> list[str]:
     is the architecturally correct fix; until that work lands we add an /Alt
     to the owning element so the AT layer at least announces "image content"
     instead of silently ignoring it.
+
+    ``fix_image_struct_elems_retag`` handles the pure-image case (no text
+    MCIDs) by retagging /S to /Figure so the downstream alt-text fix can
+    generate a real description. This function is the fallback for the
+    mixed-content case where retagging would violate PDF/UA-1.
     """
     struct_root = pdf.Root.get("/StructTreeRoot")
     if struct_root is None:
@@ -15755,6 +15869,7 @@ ALL_FIXES: list[tuple[str, callable, str]] = [
     ("tables-regularity", fix_table_regularity, "Tables have consistent cells per row"),
     ("lists-li-parent", fix_list_structure, "List structure (LI/Lbl/LBody)"),
     ("toc-structure", fix_toc_structure, "TOC structure (TOC/TOCI/Caption)"),
+    ("alt-image-struct-retag", fix_image_struct_elems_retag, "Image-only struct elements use /Figure role"),
     ("alt-figures", fix_figures_alt_text, "Figures require alternate text"),
     ("alt-figures-quality", fix_figures_alt_text_quality, "Figure alt text accurately describes visual content"),
     ("alt-formulas", fix_formula_text_equivalents, "Formula elements require text equivalents"),
@@ -15823,8 +15938,11 @@ def fix_all(
         try:
             from project_remedy.pdf_vision import create_provider_from_config
             vision_provider = create_provider_from_config(config)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Vision provider construction failed; falling back to "
+                "non-vision alt-text path: %s", exc,
+            )
 
     with ExitStack() as cleanup:
         working_pdf_path, preflight_changes, preflight_skipped, tempdir = _maybe_rebuild_broken_text_layer(
@@ -15946,8 +16064,12 @@ def fix_and_verify(
         try:
             from project_remedy.pdf_vision import create_provider_from_config
             vision_provider = create_provider_from_config(config)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Vision provider construction failed in fix_and_verify; "
+                "verify-cycle alt-text repair will use OCR fallback: %s",
+                exc,
+            )
 
     # Verification cycles.
     for cycle in range(max_cycles):

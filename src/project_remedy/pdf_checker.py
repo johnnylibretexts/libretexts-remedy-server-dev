@@ -646,6 +646,16 @@ _FILENAME_ALT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Prefixes emitted by ``_fallback_figure_alt_text`` when the vision model is
+# unavailable or returns nothing usable. Surfacing them as generic lets a later
+# remediation pass with a working vision model self-heal the alt text.
+_FALLBACK_ALT_PREFIXES = (
+    "image containing text:",
+    "figure related to page text:",
+    "figure on page ",
+    "document figure with visual content",
+)
+
 
 def _is_generic_alt_text(alt_text: str) -> bool:
     """Return True when alt text is a generic/placeholder string.
@@ -659,6 +669,8 @@ def _is_generic_alt_text(alt_text: str) -> bool:
     if not normalized:
         return True
     if normalized in _GENERIC_ALT_TEXT_LITERALS:
+        return True
+    if any(normalized.startswith(prefix) for prefix in _FALLBACK_ALT_PREFIXES):
         return True
     if _FILENAME_ALT_PATTERN.match(normalized):
         return True
